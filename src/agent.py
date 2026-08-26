@@ -1,41 +1,57 @@
+import asyncio
 import logging
+import os
 import textwrap
 
 from dotenv import load_dotenv
+from livekit import rtc
 from livekit.agents import (
     Agent,
     AgentServer,
     AgentSession,
+    ChatContext,
+    ChatMessage,
     JobContext,
     TurnHandlingOptions,
     cli,
-    inference,
+    get_job_context,
     room_io,
+    tts,
 )
-from livekit.plugins import ai_coustics
+from livekit.agents.llm import ImageContent
+from livekit.plugins import anam, cartesia, groq, silero
 
 logger = logging.getLogger("agent")
 
 load_dotenv(".env.local")
 
+DEFAULT_ANAM_AVATAR_ID = "cf437b5e-5bcb-481a-937f-b4f16560a152"
+
+
+def build_tts() -> tts.TTS:
+    return tts.FallbackAdapter(
+        [
+            cartesia.TTS(),
+            tts.StreamAdapter(tts=groq.TTS()),
+        ]
+    )
+
 
 class Assistant(Agent):
     def __init__(self) -> None:
+        self._latest_frame = None
+        self._video_stream = None
+        self._tasks = []
         super().__init__(
-            # A Large Language Model (LLM) is your agent's brain, processing user input and generating a response
-            # See all available models at https://docs.livekit.io/agents/models/llm/
-            llm=inference.LLM(model="google/gemma-4-31b-it"),
-            # To use a realtime model instead of a voice pipeline, replace the LLM
-            # with a RealtimeModel and remove the STT/TTS from the AgentSession
-            # (Note: This is for the OpenAI Realtime API. For other providers, see https://docs.livekit.io/agents/models/realtime/)
-            # 1. Install livekit-agents[openai]
-            # 2. Set OPENAI_API_KEY in .env.local
-            # 3. Add `from livekit.plugins import openai` to the top of this file
-            # 4. Replace the llm argument with:
-            #     llm=openai.realtime.RealtimeModel(voice="marin")
             instructions=textwrap.dedent(
                 """\
                 You are a friendly, reliable voice assistant that answers questions, explains topics, and completes tasks with available tools.
+
+                Always respond in the same language the user just spoke in. If the user speaks in Hindi, respond in Hindi (Devanagari script). If the user speaks in English, respond in English. If the user mixes both (Hinglish), respond in the same natural Hinglish mix.
+
+                Give direct, relevant answers to what the user actually asked. If their question or statement is unclear or the transcript seems garbled, briefly ask them to repeat or clarify instead of guessing and giving an unrelated answer.
+
+                If the user asks what you can see, describe the latest image from their camera if one is available.
 
                 # Output rules
 
@@ -54,13 +70,6 @@ class Assistant(Agent):
                 - Provide guidance in small steps and confirm completion before continuing.
                 - Summarize key results when closing a topic.
 
-                # Tools
-
-                - Use available tools as needed, or upon user request.
-                - Collect required inputs first. Perform actions silently if the runtime expects it.
-                - Speak outcomes clearly. If an action fails, say so once, propose a fallback, or ask how to proceed.
-                - When tools return structured data, summarize it to the user in a way that is easy to understand, and don't directly recite identifiers or other technical details.
-
                 # Guardrails
 
                 - Stay within safe, lawful, and appropriate use; decline harmful or out-of-scope requests.
@@ -70,22 +79,63 @@ class Assistant(Agent):
             ),
         )
 
-    # To add tools, use the @function_tool decorator.
-    # Here's an example that adds a simple weather tool.
-    # You also have to add `from livekit.agents import function_tool, RunContext` to the top of this file
-    # @function_tool
-    # async def lookup_weather(self, context: RunContext, location: str):
-    #     """Use this tool to look up current weather information in the given location.
-    #
-    #     If the location is not supported by the weather service, the tool will indicate this. You must tell the user the location's weather is unavailable.
-    #
-    #     Args:
-    #         location: The location to look up weather information for (e.g. city name)
-    #     """
-    #
-    #     logger.info(f"Looking up weather for {location}")
-    #
-    #     return "sunny with a temperature of 70 degrees."
+    async def on_enter(self):
+        room = get_job_context().room
+
+        user_participant = next(
+            (
+                participant
+                for participant in room.remote_participants.values()
+                if participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_STANDARD
+            ),
+            None,
+        )
+        if user_participant:
+            video_tracks = [
+                publication.track
+                for publication in list(user_participant.track_publications.values())
+                if publication.track
+                and publication.track.kind == rtc.TrackKind.KIND_VIDEO
+            ]
+            if video_tracks:
+                self._create_video_stream(video_tracks[0])
+
+        @room.on("track_subscribed")
+        def on_track_subscribed(track: rtc.Track, publication, participant):
+            if (
+                participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_STANDARD
+                and track.kind == rtc.TrackKind.KIND_VIDEO
+            ):
+                self._create_video_stream(track)
+
+    async def on_user_turn_completed(
+        self, turn_ctx: ChatContext, new_message: ChatMessage
+    ) -> None:
+        if self._latest_frame:
+            new_message.content.append(ImageContent(image=self._latest_frame))
+            self._latest_frame = None
+
+    def _create_video_stream(self, track: rtc.Track):
+        if self._video_stream is not None:
+            old = self._video_stream
+            self._video_stream = None
+            self._track_task(asyncio.create_task(old.aclose()))
+
+        self._video_stream = rtc.VideoStream(track)
+
+        async def read_stream():
+            async for event in self._video_stream:
+                self._latest_frame = event.frame
+
+        self._track_task(asyncio.create_task(read_stream()))
+
+    def _track_task(self, task: asyncio.Task[object]) -> None:
+        def remove_task(completed_task: asyncio.Task[object]) -> None:
+            if completed_task in self._tasks:
+                self._tasks.remove(completed_task)
+
+        task.add_done_callback(remove_task)
+        self._tasks.append(task)
 
 
 server = AgentServer()
@@ -93,68 +143,49 @@ server = AgentServer()
 
 @server.rtc_session(agent_name="my-agent")
 async def my_agent(ctx: JobContext):
-    # Logging setup
-    # Add any other context you want in all log entries here
     ctx.log_context_fields = {
         "room": ctx.room.name,
     }
 
-    # Set up a voice AI pipeline using AssemblyAI, Fish Audio, and the LiveKit turn detector
     session = AgentSession(
-        # Speech-to-text (STT) is your agent's ears, turning the user's speech into text that the LLM can understand
-        # See all available models at https://docs.livekit.io/agents/models/stt/
-        stt=inference.STT(model="assemblyai/universal-3-5-pro", language="en"),
-        # Text-to-speech (TTS) is your agent's voice, turning the LLM's text into speech that the user can hear
-        # See all available models as well as voice selections at https://docs.livekit.io/agents/models/tts/
-        tts=inference.TTS(
-            model="fishaudio/s2.1-pro", voice="fa4c9eb3dccc4806b382b40d61c6b10a"
+        stt=groq.STT(model="whisper-large-v3-turbo", detect_language=True),
+        llm=groq.LLM(
+            model="qwen/qwen3.6-27b",
+            reasoning_effort="none",
+            max_completion_tokens=300,
+            timeout=15.0,
         ),
+        tts=build_tts(),
+        vad=silero.VAD.load(),
         turn_handling=TurnHandlingOptions(
-            # The LiveKit turn detector determines when the user is done speaking and the agent should respond.
-            # TurnDetector is an end-of-turn model that listens to the user's audio directly, combining
-            # semantic understanding with acoustic cues (intonation, pitch, rhythm) for state-of-the-art accuracy.
-            # AgentSession supplies the required VAD automatically.
-            # See more at https://docs.livekit.io/agents/build/turns
-            turn_detection=inference.TurnDetector(),
-            # Adaptive interruptions use the turn detector to tell a real interruption from a
-            # backchannel like "mhm" or "right", so the agent keeps talking through the latter.
             interruption={"mode": "adaptive"},
-            # allow the LLM to generate a response while waiting for the end of turn
-            # See more at https://docs.livekit.io/agents/build/audio/#preemptive-generation
-            preemptive_generation={"enabled": True},
+            min_endpointing_delay=0.8,
         ),
-        # Expressive mode injects the TTS provider's markup guide into the LLM prompt, so the model
-        # emits inline delivery tags (emotion, pacing, non-verbal sounds) that the TTS renders and
-        # the transcript never shows. Requires a TTS model that supports markup, such as the Fish
-        # Audio model above.
-        expressive=True,
     )
 
-    # Start the session, which initializes the voice pipeline and warms up the models
+    avatar_ready = False
+    try:
+        avatar = anam.AvatarSession(
+            persona_config=anam.PersonaConfig(
+                name=os.getenv("ANAM_AVATAR_NAME", "Mia"),
+                avatarId=os.getenv("ANAM_AVATAR_ID", DEFAULT_ANAM_AVATAR_ID),
+            ),
+            session_options=anam.SessionOptions(show_ai_avatar_disclosure=True),
+        )
+        await avatar.start(session, room=ctx.room)
+        await avatar.wait_for_join()
+        avatar_ready = True
+    except Exception:
+        logger.exception("Avatar could not start; continuing with voice and text only")
+
     await session.start(
         agent=Assistant(),
         room=ctx.room,
-        room_options=room_io.RoomOptions(
-            audio_input=room_io.AudioInputOptions(
-                noise_cancellation=ai_coustics.audio_enhancement(
-                    model=ai_coustics.EnhancerModel.QUAIL_VF_S
-                ),
-            ),
-        ),
+        room_options=room_io.RoomOptions(audio_output=False)
+        if avatar_ready
+        else room_io.RoomOptions(),
     )
 
-    # # Add a virtual avatar to the session, if desired
-    # # For other providers, see https://docs.livekit.io/agents/models/avatar/
-    # avatar = anam.AvatarSession(
-    #     persona_config=anam.PersonaConfig(
-    #         name="...",
-    #         avatarId="...",  # See https://docs.livekit.io/agents/models/avatar/plugins/anam
-    #     ),
-    # )
-    # # Start the avatar and wait for it to join
-    # await avatar.start(session, room=ctx.room)
-
-    # Join the room and connect to the user
     await ctx.connect()
 
 

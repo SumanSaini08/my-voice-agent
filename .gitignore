@@ -31,3 +31,8 @@ KMS
 
 # GitHub CLI
 .github/personal-instructions.md
+
+livekit-server.exe
+.uv-cache/
+.opencode/
+.agents/

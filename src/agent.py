@@ -23,9 +23,18 @@ from livekit.plugins import anam, cartesia, groq, silero
 
 logger = logging.getLogger("agent")
 
+# Strong references to long-running background tasks (e.g. the avatar bring-up)
+# so they are never garbage-collected mid-run.
+_background_tasks: set[asyncio.Task] = set()
+
 load_dotenv(".env.local")
 
 DEFAULT_ANAM_AVATAR_ID = "cf437b5e-5bcb-481a-937f-b4f16560a152"
+
+# How long to wait for the ANAM avatar to publish before giving up on it and
+# falling back to plain room audio. Kept short so the avatar's (external API +
+# join) latency can never stall the LiveKit room connection.
+AVATAR_JOIN_TIMEOUT_SECONDS = 20.0
 
 
 def build_tts() -> tts.TTS:
@@ -153,6 +162,13 @@ def build_server() -> AgentServer:
 server = build_server()
 
 
+def _spawn_background(coro) -> None:
+    """Run a fire-and-forget coroutine, keeping it referenced until done."""
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
 @server.rtc_session(agent_name="my-agent")
 async def my_agent(ctx: JobContext):
     ctx.log_context_fields = {
@@ -175,7 +191,27 @@ async def my_agent(ctx: JobContext):
         ),
     )
 
-    avatar_ready = False
+    # Connect to LiveKit first and start the voice session immediately, so the
+    # job is never torn down for being slow to connect. The ANAM avatar is an
+    # optional enhancement and is brought up on a background task afterwards.
+    await ctx.connect()
+    await session.start(
+        agent=Assistant(),
+        room=ctx.room,
+        room_options=room_io.RoomOptions(),
+    )
+
+    _spawn_background(start_avatar(session, ctx.room))
+
+
+async def start_avatar(session: AgentSession, room: rtc.Room) -> None:
+    """Best-effort ANAM avatar kept off the session-connect critical path.
+
+    The avatar redirects the agent's TTS output into a data stream consumed by
+    the avatar participant; if it never joins, the user would hear silence, so
+    the room audio output is re-attached in that case.
+    """
+    avatar_joined = False
     try:
         avatar = anam.AvatarSession(
             persona_config=anam.PersonaConfig(
@@ -184,21 +220,35 @@ async def my_agent(ctx: JobContext):
             ),
             session_options=anam.SessionOptions(show_ai_avatar_disclosure=True),
         )
-        await avatar.start(session, room=ctx.room)
-        await avatar.wait_for_join()
-        avatar_ready = True
+        await avatar.start(session, room=room)
+        await asyncio.wait_for(
+            avatar.wait_for_join(),
+            timeout=AVATAR_JOIN_TIMEOUT_SECONDS,
+        )
+        avatar_joined = True
+    except asyncio.TimeoutError:
+        logger.warning("Avatar did not join within %.0f seconds; continuing voice only", AVATAR_JOIN_TIMEOUT_SECONDS)
     except Exception:
         logger.exception("Avatar could not start; continuing with voice and text only")
 
-    await session.start(
-        agent=Assistant(),
-        room=ctx.room,
-        room_options=room_io.RoomOptions(audio_output=False)
-        if avatar_ready
-        else room_io.RoomOptions(),
-    )
+    if not avatar_joined:
+        await _restore_room_audio(session)
 
-    await ctx.connect()
+
+async def _restore_room_audio(session: AgentSession) -> None:
+    """Route agent TTS back to the room when the avatar could not be used.
+
+    ``anam.AvatarSession.start`` replaces the session's audio tail with a
+    data-stream sink addressed to the avatar participant. If the avatar never
+    joins, that sink has no consumer, so re-attach the RoomIO audio output to
+    make the agent audible again.
+    """
+    try:
+        room_io = session.room_io
+        if room_io is not None and room_io.audio_output is not None:
+            session.output.audio = room_io.audio_output
+    except Exception:
+        logger.exception("Could not restore room audio output after avatar failure")
 
 
 if __name__ == "__main__":

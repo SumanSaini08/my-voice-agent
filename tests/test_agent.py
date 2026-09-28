@@ -1,9 +1,11 @@
+import asyncio
 import textwrap
 
 import pytest
 from livekit.agents import AgentServer, AgentSession, llm, tts
 from livekit.plugins import cartesia, groq
 
+import agent as agent_mod
 from agent import Assistant, build_server, build_tts
 
 
@@ -182,3 +184,156 @@ async def test_refuses_harmful_request() -> None:
 
         # Ensures there are no function calls or other unexpected events
         result.expect.no_more_events()
+
+
+def test_agent_connects_to_livekit_cloud() -> None:
+    """The production entrypoint must register under the worker's agent name so
+    that LiveKit Cloud's dispatch routes calls to this deployed worker."""
+    assert agent_mod.server._agent_name == "my-agent"
+    assert agent_mod.server._entrypoint_fnc is not None
+
+
+@pytest.mark.asyncio
+async def test_my_agent_connects_then_starts_session_and_defers_avatar(monkeypatch) -> None:
+    """The job must connect to LiveKit as early as possible.
+
+    ANAM's avatar (external API + join wait) used to run *before* connect,
+    which stalled the room connection for seconds and made LiveKit tear the
+    session down. The critical path is now: connect -> start voice session ->
+    schedule avatar off to a background task.
+    """
+    events: list[str] = []
+
+    class FakeRoom:
+        name = "room-under-test"
+
+    class FakeCtx:
+        def __init__(self) -> None:
+            self.log_context_fields: dict = {}
+            self.room = FakeRoom()
+            self.connected = False
+
+        async def connect(self) -> None:
+            events.append("connect")
+            self.connected = True
+
+    class FakeSession:
+        def __init__(self, **kwargs) -> None:
+            pass
+
+        async def start(self, **kwargs) -> None:
+            events.append("session_start")
+            self.agent = kwargs["agent"]
+            self.room_options_tracking = kwargs["room_options"]
+
+    async def fake_start_avatar(session, room) -> None:
+        events.append("avatar_started")
+
+    monkeypatch.setattr(agent_mod, "AgentSession", FakeSession)
+    monkeypatch.setattr(agent_mod, "start_avatar", fake_start_avatar)
+
+    ctx = FakeCtx()
+    await agent_mod.my_agent(ctx)
+
+    # my_agent returns without having awaited the avatar inline.
+    assert events == ["connect", "session_start"]
+    assert ctx.connected
+
+    # The avatar work is scheduled as a background task and runs afterwards.
+    for _ in range(100):
+        await asyncio.sleep(0)
+        if "avatar_started" in events:
+            break
+    assert "avatar_started" in events
+
+
+@pytest.mark.asyncio
+async def test_start_avatar_survives_avatar_api_failure(monkeypatch) -> None:
+    """If the ANAM engine fails, the session must keep going voice-only and
+    room audio must be restored so the user can still hear the agent."""
+
+    class FailingAvatar:
+        def __init__(self, **kwargs) -> None:
+            pass
+
+        async def start(self, session, room) -> None:
+            raise RuntimeError("anam api exploded")
+
+    monkeypatch.setattr(agent_mod.anam, "AvatarSession", FailingAvatar)
+
+    class FakeRoomIO:
+        audio_output = "roomio-sink"
+
+    class FakeSession:
+        def __init__(self) -> None:
+            self.room_io = FakeRoomIO()
+            self.output = type("Out", (), {"audio": None})()
+
+    session = FakeSession()
+    await agent_mod.start_avatar(session, object())
+
+    assert session.output.audio == "roomio-sink"
+
+
+@pytest.mark.asyncio
+async def test_start_avatar_restores_room_audio_after_join_timeout(monkeypatch) -> None:
+    """A long-running avatar join must not make the job hang, and after the
+    timeout the agent's audio must be routed back to the room."""
+
+    class SlowAvatar:
+        def __init__(self, **kwargs) -> None:
+            pass
+
+        async def start(self, session, room) -> None:
+            return None
+
+        async def wait_for_join(self, **kwargs) -> None:
+            await asyncio.sleep(5)
+
+    monkeypatch.setattr(agent_mod.anam, "AvatarSession", SlowAvatar)
+    monkeypatch.setattr(agent_mod, "AVATAR_JOIN_TIMEOUT_SECONDS", 0.05)
+
+    class FakeRoomIO:
+        audio_output = "roomio-sink"
+
+    class FakeSession:
+        def __init__(self) -> None:
+            self.room_io = FakeRoomIO()
+            self.output = type("Out", (), {"audio": None})()
+
+    session = FakeSession()
+    await agent_mod.start_avatar(session, object())
+
+    assert session.output.audio == "roomio-sink"
+
+
+@pytest.mark.asyncio
+async def test_start_avatar_keeps_avatar_audio_when_it_joins(monkeypatch) -> None:
+    """When the avatar joins successfully, the agent audio stays routed to the
+    avatar (no generic room audio restore)."""
+
+    class GoodAvatar:
+        def __init__(self, **kwargs) -> None:
+            pass
+
+        async def start(self, session, room) -> None:
+            return None
+
+        async def wait_for_join(self, **kwargs) -> None:
+            return None
+
+    monkeypatch.setattr(agent_mod.anam, "AvatarSession", GoodAvatar)
+
+    class FakeRoomIO:
+        audio_output = "roomio-sink"
+
+    class FakeSession:
+        def __init__(self) -> None:
+            self.room_io = FakeRoomIO()
+            self.output = type("Out", (), {"audio": None})()
+
+    session = FakeSession()
+    await agent_mod.start_avatar(session, object())
+
+    # Avatar path is authoritative for audio; leave output.audio untouched.
+    assert session.output.audio is None

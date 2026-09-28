@@ -36,3 +36,10 @@ livekit-server.exe
 .uv-cache/
 .opencode/
 .agents/
+
+# Vercel
+.vercel
+
+# Next.js / node (in case deps are hoisted to repo root)
+node_modules/
+.next/

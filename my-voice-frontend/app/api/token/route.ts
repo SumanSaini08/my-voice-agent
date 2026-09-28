@@ -1,6 +1,9 @@
+import { cookies } from 'next/headers';
 import { NextResponse } from 'next/server';
 import { AccessToken, type AccessTokenOptions, type VideoGrant } from 'livekit-server-sdk';
 import { RoomConfiguration } from '@livekit/protocol';
+import { SESSION_COOKIE, evaluateSession, isAuthConfigured } from '@/lib/auth';
+import { getClientIp, getRateLimiter } from '@/lib/rate-limit';
 
 type ConnectionDetails = {
   serverUrl: string;
@@ -14,15 +17,44 @@ const API_KEY = process.env.LIVEKIT_API_KEY;
 const API_SECRET = process.env.LIVEKIT_API_SECRET;
 const LIVEKIT_URL = process.env.LIVEKIT_URL;
 
+const isDev = process.env.NODE_ENV !== 'production';
+const sessionSecret = process.env.SESSION_SECRET ?? '';
+const tokenApiKey = process.env.TOKEN_API_KEY ?? '';
+
 // don't cache the results
 export const revalidate = 0;
 
 export async function POST(req: Request) {
-  // make an exception for the vercel preview environment
-  if (process.env.NODE_ENV !== 'development' && process.env.IS_VERCEL_PREVIEW !== 'true') {
-    throw new Error(
-      'THIS API ROUTE IS INSECURE. DO NOT USE THIS ROUTE IN PRODUCTION WITHOUT AN AUTHENTICATION LAYER.'
+  // This route mints LiveKit participant tokens, so it is the single most
+  // sensitive endpoint in the app. It requires a valid httpOnly session that
+  // was issued by /api/auth in exchange for the server-side access code.
+  // Both secrets stay server-side; nothing is exposed via NEXT_PUBLIC_*.
+  const ip = getClientIp(req.headers);
+  const limited = getRateLimiter('token-issuance', 30, 60_000).check(ip);
+  if (!limited.ok) {
+    return NextResponse.json(
+      { error: 'Too many requests. Please wait and try again.' },
+      { status: 429, headers: { 'Retry-After': String(limited.retryAfterSec) } }
     );
+  }
+
+  const store = await cookies();
+  const session = await evaluateSession({
+    cookie: store.get(SESSION_COOKIE)?.value,
+    sessionSecret,
+    isDev,
+    authEnabled: isAuthConfigured({ tokenApiKey, sessionSecret }),
+  });
+
+  if (session === 'unconfigured') {
+    return NextResponse.json(
+      { error: 'Server auth is not configured. Set TOKEN_API_KEY and SESSION_SECRET.' },
+      { status: 503 }
+    );
+  }
+
+  if (session === 'deny') {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
   }
 
   try {

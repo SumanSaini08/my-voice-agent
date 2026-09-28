@@ -9,7 +9,7 @@ from agent import Assistant, build_tts
 
 def _judge_llm() -> llm.LLM:
     return groq.LLM(
-        model="qwen/qwen3.6-27b",
+        model="qwen/qwen3.8-27b",
         reasoning_effort="none",
         max_completion_tokens=300,
         timeout=15.0,
@@ -19,7 +19,7 @@ def _judge_llm() -> llm.LLM:
 def _agent_llm() -> llm.LLM:
     """Use an LLM for the session under test, not only for evaluation."""
     return groq.LLM(
-        model="qwen/qwen3.6-27b",
+        model="qwen/qwen3.8-27b",
         reasoning_effort="none",
         max_completion_tokens=300,
         timeout=15.0,

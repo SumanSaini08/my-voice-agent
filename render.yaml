@@ -1,0 +1,53 @@
+# Render Blueprint for the LiveKit Agents worker.
+#
+# IMPORTANT: this service is a BACKGROUND WORKER, not a web service.
+#
+# The agent in src/agent.py is a LiveKit Agents worker. It does not serve HTTP.
+# It dials OUT to LiveKit Cloud over a persistent WebSocket, registers itself
+# as an agent (agent_name="my-agent"), and then blocks waiting for job
+# dispatches. Therefore:
+#   - there is no listening port, so there is nothing to expose
+#   - there is no HTTP health check path
+#   - there is no CORS (the browser never calls this service directly)
+#
+# The Next.js frontend (my-voice-frontend/) on Vercel talks to LiveKit Cloud,
+# never to this worker. The two are peers, not client/server.
+#
+# `plan: starter` is required because Render does not offer background workers
+# on the free plan. Cheapest paid tier that supports workers.
+services:
+  - type: worker
+    name: my-voice-agent-worker
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    plan: starter
+    region: oregon
+    # Secrets only. Never commit real values; Render injects them at runtime.
+    envVars:
+      # --- LiveKit Cloud connection (required) ---
+      - key: LIVEKIT_URL
+        sync: false
+      - key: LIVEKIT_API_KEY
+        sync: false
+      - key: LIVEKIT_API_SECRET
+        sync: false
+
+      # --- Model providers (required; src/agent.py fails fast without these) ---
+      # Groq supplies STT (whisper-large-v3-turbo), LLM (qwen3.6-27b),
+      # and the TTS fallback (Orpheus).
+      - key: GROQ_API_KEY
+        sync: false
+      # Cartesia is the primary TTS.
+      - key: CARTESIA_API_KEY
+        sync: false
+      # Anam drives the avatar. Optional: the agent degrades to
+      # voice+text only if the avatar fails to start.
+      - key: ANAM_API_KEY
+        sync: false
+
+      # --- Optional avatar overrides (defaults exist in src/agent.py) ---
+      - key: ANAM_AVATAR_NAME
+        sync: false
+      - key: ANAM_AVATAR_ID
+        sync: false

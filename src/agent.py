@@ -150,7 +150,7 @@ async def my_agent(ctx: JobContext):
     session = AgentSession(
         stt=groq.STT(model="whisper-large-v3-turbo", detect_language=True),
         llm=groq.LLM(
-            model="qwen/qwen3.6-27b",
+            model="qwen/qwen3.8-27b",
             reasoning_effort="none",
             max_completion_tokens=300,
             timeout=15.0,

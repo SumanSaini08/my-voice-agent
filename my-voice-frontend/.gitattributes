@@ -1,0 +1,17 @@
+# Normalize line endings in the repository.
+#
+# Without this, Windows checkouts (core.autocrlf=true) rewrite LF to CRLF, which
+# trips prettier's default endOfLine:'lf' check and fails `next build`. Keeping
+# LF in the working tree makes local lint and CI (Vercel/Render run on Linux)
+# agree.
+* text=auto eol=lf
+
+# Keep these as-is; they must stay byte-exact.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+*.exe binary

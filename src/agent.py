@@ -138,7 +138,19 @@ class Assistant(Agent):
         self._tasks.append(task)
 
 
-server = AgentServer()
+def build_server() -> AgentServer:
+    """Construct the worker with a health HTTP server on 0.0.0.0:PORT.
+
+    Render injects PORT and requires the process to bind to 0.0.0.0 so its
+    HTTP health check at ``/`` can reach us. The default 8081 keeps local
+    development working without a PORT set.
+    """
+    host = os.environ.get("HOST", "0.0.0.0")
+    port = int(os.environ.get("PORT", "8081"))
+    return AgentServer(host=host, port=port)
+
+
+server = build_server()
 
 
 @server.rtc_session(agent_name="my-agent")

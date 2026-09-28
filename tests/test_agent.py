@@ -1,10 +1,10 @@
 import textwrap
 
 import pytest
-from livekit.agents import AgentSession, llm, tts
+from livekit.agents import AgentServer, AgentSession, llm, tts
 from livekit.plugins import cartesia, groq
 
-from agent import Assistant, build_tts
+from agent import Assistant, build_server, build_tts
 
 
 def _judge_llm() -> llm.LLM:
@@ -46,6 +46,33 @@ def test_tts_falls_back_to_groq_when_cartesia_fails() -> None:
     assert isinstance(fallback, tts.StreamAdapter)
     assert isinstance(fallback._wrapped_tts, groq.TTS)
     assert "orpheus" in fallback._wrapped_tts._opts.model
+
+
+def test_server_binds_health_http_to_render_port(monkeypatch) -> None:
+    """Render passes PORT and needs 0.0.0.0 so its / health check can reach us."""
+    monkeypatch.setenv("PORT", "54321")
+    srv = build_server()
+
+    assert isinstance(srv, AgentServer)
+    assert srv._host == "0.0.0.0"
+    assert srv._port == 54321
+
+
+def test_server_defaults_port_8081(monkeypatch) -> None:
+    monkeypatch.delenv("PORT", raising=False)
+    srv = build_server()
+
+    assert srv._host == "0.0.0.0"
+    assert srv._port == 8081
+
+
+def test_server_uses_host_env_override(monkeypatch) -> None:
+    monkeypatch.setenv("HOST", "127.0.0.1")
+    monkeypatch.setenv("PORT", "9999")
+    srv = build_server()
+
+    assert srv._host == "127.0.0.1"
+    assert srv._port == 9999
 
 
 @pytest.mark.asyncio

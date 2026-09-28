@@ -1,29 +1,21 @@
-# Render Blueprint for the LiveKit Agents worker.
+# Render Blueprint for the voice agent worker, run as a free-tier Web Service.
 #
-# IMPORTANT: this service is a BACKGROUND WORKER, not a web service.
+# NB: The process behind this is a LiveKit Agents worker, not a web app. It
+# binds a small HTTP health server on 0.0.0.0:$PORT (see src/agent.py
+# build_server()) so Render's health check at "/" can keep it alive, and it
+# separately dials OUT to LiveKit Cloud to register as agent "my-agent".
 #
-# The agent in src/agent.py is a LiveKit Agents worker. It does not serve HTTP.
-# It dials OUT to LiveKit Cloud over a persistent WebSocket, registers itself
-# as an agent (agent_name="my-agent"), and then blocks waiting for job
-# dispatches. Therefore:
-#   - there is no listening port, so there is nothing to expose
-#   - there is no HTTP health check path
-#   - there is no CORS (the browser never calls this service directly)
-#
-# The Next.js frontend (my-voice-frontend/) on Vercel talks to LiveKit Cloud,
-# never to this worker. The two are peers, not client/server.
-#
-# `plan: starter` is required because Render does not offer background workers
-# on the free plan. Cheapest paid tier that supports workers.
+# No secret values live here. Values are set via the Render dashboard or API
+# and stored there; `sync: false` keeps them out of this file and out of git.
 services:
-  - type: worker
+  - type: web_service
     name: my-voice-agent-worker
     runtime: docker
     dockerfilePath: ./Dockerfile
     dockerContext: .
-    plan: starter
+    plan: free
     region: oregon
-    # Secrets only. Never commit real values; Render injects them at runtime.
+    healthCheckPath: /
     envVars:
       # --- LiveKit Cloud connection (required) ---
       - key: LIVEKIT_URL
@@ -34,7 +26,7 @@ services:
         sync: false
 
       # --- Model providers (required; src/agent.py fails fast without these) ---
-      # Groq supplies STT (whisper-large-v3-turbo), LLM (qwen3.6-27b),
+      # Groq supplies STT (whisper-large-v3-turbo), LLM (qwen3.8-27b),
       # and the TTS fallback (Orpheus).
       - key: GROQ_API_KEY
         sync: false

@@ -77,6 +77,33 @@ def test_server_uses_host_env_override(monkeypatch) -> None:
     assert srv._port == 9999
 
 
+def test_server_prewarms_single_idle_process_by_default(monkeypatch) -> None:
+    """Pre-warm only one idle process so a constrained Render instance is not
+    saturated (and OOM'd) spawning cpu_count() heavy plugin stacks at startup."""
+    monkeypatch.delenv("NUM_IDLE_PROCESSES", raising=False)
+    srv = build_server()
+
+    assert srv._num_idle_processes == 1
+
+
+def test_server_allows_longer_idle_initialization_on_slow_cpu(monkeypatch) -> None:
+    """Silero VAD + plugin warmup can exceed the stock 10s on a 0.1 CPU box;
+    use a generous timeout so the pool is ready before the first call."""
+    monkeypatch.delenv("INITIALIZE_PROCESS_TIMEOUT", raising=False)
+    srv = build_server()
+
+    assert srv._initialize_process_timeout == 60.0
+
+
+def test_server_env_tuning_overrides_worker_options(monkeypatch) -> None:
+    monkeypatch.setenv("NUM_IDLE_PROCESSES", "2")
+    monkeypatch.setenv("INITIALIZE_PROCESS_TIMEOUT", "45")
+    srv = build_server()
+
+    assert srv._num_idle_processes == 2
+    assert srv._initialize_process_timeout == 45.0
+
+
 @pytest.mark.asyncio
 async def test_offers_assistance() -> None:
     """Evaluation of the agent's friendly nature."""

@@ -153,10 +153,32 @@ def build_server() -> AgentServer:
     Render injects PORT and requires the process to bind to 0.0.0.0 so its
     HTTP health check at ``/`` can reach us. The default 8081 keeps local
     development working without a PORT set.
+
+    The worker toys here are tuned for Render's constrained free instance
+    (see ``AgentServer`` for the full option list):
+
+    - ``num_idle_processes=1``: pre-warm a single idle process instead of
+      ``cpu_count()``. Each idle process preloads silero VAD plus the STT/LLM
+      plugins; on a CPU/RAM-limited box that many stacks at once saturates the
+      box and pushes the worker over its load threshold before the first call.
+    - ``initialize_process_timeout=60``: the stock 10s timeout is too short
+      for warming the plugin stack on a 0.1 CPU instance; bump it so the idle
+      pool is reported ready (previously the worker logged "timed out waiting
+      for idle processes to initialize" and calls failed with
+      "did not complete initializing").
+    - memory knobs are left at their defaults (warn 1000 MB / limit 0 = no
+      limit); nothing here kills a job early on a 512 MB box.
     """
     host = os.environ.get("HOST", "0.0.0.0")
     port = int(os.environ.get("PORT", "8081"))
-    return AgentServer(host=host, port=port)
+    return AgentServer(
+        host=host,
+        port=port,
+        num_idle_processes=int(os.environ.get("NUM_IDLE_PROCESSES", "1")),
+        initialize_process_timeout=float(
+            os.environ.get("INITIALIZE_PROCESS_TIMEOUT", "60.0")
+        ),
+    )
 
 
 server = build_server()
